@@ -1,12 +1,7 @@
 # run in shell with this command:
 
 """
-accelerate launch \
-  --num_processes=2 \
-  --num_machines=1 \
-  --mixed_precision=bf16 \
-  --use_fsdp \
-  "GPT OSS Finetuning (FSDP2).py"
+!deepspeed --num_gpus=3 "GPT OSS Finetuning (ZeRO).py"
 """
 
 import os
@@ -15,6 +10,7 @@ print("Installing required packages...")
 os.system("pip install -q datasets transformers peft trl accelerate")
 os.system("pip install -q flash-attn --no-build-isolation")
 
+import os
 import json
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -56,14 +52,14 @@ print("\nLoading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-120b")
 print("✓ Tokenizer loaded")
 
-# Step 3: Load model WITHOUT device_map (FSDP will handle device placement)
+# Step 3: Load model WITHOUT device_map (DeepSpeed will handle device placement)
 print("\nLoading model...")
 model = AutoModelForCausalLM.from_pretrained(
     "openai/gpt-oss-120b",
     attn_implementation="flash_attention_2",
     torch_dtype=torch.bfloat16,  # Use bfloat16 for better stability
     use_cache=False,  # Required for training with gradient checkpointing
-    # DO NOT use device_map with FSDP - FSDP handles device placement
+    # DO NOT use device_map with DeepSpeed - DeepSpeed handles device placement
 )
 print("✓ Model loaded")
 
@@ -87,15 +83,15 @@ lora_config = LoraConfig(
 peft_model = get_peft_model(model, lora_config)
 peft_model.print_trainable_parameters()
 
-# Step 5: Configure training parameters with FSDP
+# Step 5: Configure training parameters with DeepSpeed ZeRO-3
 print("\nConfiguring training...")
 training_args = SFTConfig(
     # Training hyperparameters
     learning_rate=2e-4,
     num_train_epochs=3,
     per_device_train_batch_size=8,
-    gradient_accumulation_steps=2,
-    max_length=256,
+    gradient_accumulation_steps=4,
+    max_ength=256,
     
     # Learning rate schedule
     warmup_ratio=0.03,
@@ -111,27 +107,53 @@ training_args = SFTConfig(
     # Optimization settings
     bf16=True,  # Use bfloat16 for better numerical stability
     dataloader_drop_last=True,
-    gradient_checkpointing=False,
+    gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
     
     # Reporting
     report_to="none",  # Change to "wandb" or "tensorboard" if you want logging
     
-    # FSDP Configuration for 2 GPUs
-    fsdp="full_shard",
-    fsdp_config={
-        "fsdp_auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
-        "fsdp_backward_prefetch": "BACKWARD_PRE",
-        "fsdp_forward_prefetch": "True",
-        "fsdp_cpu_ram_efficient_loading": "True",
-        "fsdp_offload_params": "False",  # Set to "True" if you run out of GPU memory
-        "fsdp_sharding_strategy": "FULL_SHARD",
-        "fsdp_state_dict_type": "SHARDED_STATE_DICT",
-        "fsdp_sync_module_states": "True",
-        "fsdp_use_orig_params": "True",  # Critical for LoRA compatibility
-        "fsdp_transformer_layer_cls_to_wrap": "LlamaDecoderLayer",  # Adjust if needed
-    },
+    # DeepSpeed ZeRO-3 Configuration
+    deepspeed="ds_config.json",  # Will create this config file
 )
+
+# Create DeepSpeed configuration file
+ds_config = {
+    "bf16": {
+        "enabled": True
+    },
+    "zero_optimization": {
+        "stage": 3,  # ZeRO-3: partition optimizer states, gradients, and parameters
+        "offload_optimizer": {
+            "device": "cpu",  # Offload optimizer states to CPU to save GPU memory
+            "pin_memory": True
+        },
+        "offload_param": {
+            "device": "cpu",  # Offload parameters to CPU (use if needed)
+            "pin_memory": True
+        },
+        "overlap_comm": True,
+        "contiguous_gradients": True,
+        "sub_group_size": 1e9,
+        "reduce_bucket_size": "auto",
+        "stage3_prefetch_bucket_size": "auto",
+        "stage3_param_persistence_threshold": "auto",
+        "stage3_max_live_parameters": 1e9,
+        "stage3_max_reuse_distance": 1e9,
+        "stage3_gather_16bit_weights_on_model_save": True
+    },
+    "gradient_accumulation_steps": 4,
+    "gradient_clipping": 1.0,
+    "steps_per_print": 10,
+    "train_batch_size": "auto",
+    "train_micro_batch_size_per_gpu": "auto",
+    "wall_clock_breakdown": False
+}
+
+# Save DeepSpeed config
+with open("ds_config.json", "w") as f:
+    json.dump(ds_config, f, indent=2)
+print("✓ DeepSpeed config created: ds_config.json")
 
 # Step 6: Initialize trainer
 print("\nInitializing trainer...")
@@ -166,34 +188,24 @@ print("Training complete!")
 print("="*50)
 
 # Step 9: Test inference (optional)
-def test_inference(prompt="What is machine learning?"):
+def test_inference(prompt="Tell me a story about a robot."):
     """Test the fine-tuned model with a sample prompt"""
     print(f"\nTesting inference with prompt: '{prompt}'")
     
-    # Load the fine-tuned model directly for inference
-    print("Loading fine-tuned model for inference...")
-    
-    # Load the base model first
+    # Load the base model for inference
     base_model = AutoModelForCausalLM.from_pretrained(
         "openai/gpt-oss-120b",
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map="auto",  # OK to use device_map for inference
         use_cache=True
     )
     
-    # Load the fine-tuned LoRA adapter
+    # Load the fine-tuned LoRA weights
     model = PeftModel.from_pretrained(
         base_model, 
-        "gpt-oss-120b-custom-finetuned",
-        device_map="auto"
+        "gpt-oss-120b-custom-finetuned"
     )
-    
-    # Merge LoRA weights with base model for inference
-    print("Merging LoRA weights...")
     model = model.merge_and_unload()
-    
-    # Move model to evaluation mode
-    model.eval()
     
     # Prepare the prompt
     messages = [
@@ -201,7 +213,6 @@ def test_inference(prompt="What is machine learning?"):
         {"role": "user", "content": prompt}
     ]
     
-    print("Tokenizing prompt...")
     input_ids = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
@@ -212,14 +223,11 @@ def test_inference(prompt="What is machine learning?"):
         "max_new_tokens": 512,
         "do_sample": True,
         "temperature": 0.7,
-        "top_p": 0.9,
-        "pad_token_id": tokenizer.eos_token_id  # Important: set pad token
+        "top_p": 0.9
     }
     
     print("Generating response...")
-    with torch.no_grad():
-        output_ids = model.generate(input_ids, **gen_kwargs)
-    
+    output_ids = model.generate(input_ids, **gen_kwargs)
     response = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
     
     print("\n" + "="*50)
@@ -235,4 +243,4 @@ def test_inference(prompt="What is machine learning?"):
     gc.collect()
 
 # Uncomment to test inference
-# test_inference("")
+# test_inference("What is machine learning?")
