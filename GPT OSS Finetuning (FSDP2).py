@@ -2,7 +2,7 @@
 
 """
 accelerate launch \
-  --num_processes=2 \
+  --num_processes=3 \
   --num_machines=1 \
   --mixed_precision=bf16 \
   --use_fsdp \
